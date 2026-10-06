@@ -2,6 +2,7 @@ import os
 import pickle
 import pandas as pd
 import streamlit as st
+import duckdb
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 MODEL_PATH = os.path.join(DATA_DIR, "cbb_model.pkl")
@@ -73,3 +74,92 @@ else:
             team_b_name: [f"{team_b['adj_oe']:.1f}", f"{team_b['adj_de']:.1f}", f"{team_b['efg_off']:.1f}%", f"{team_b['to_rate']:.1f}%"]
         })
         st.table(breakdown_df)
+
+
+    st.markdown("---")
+    st.subheader("📊 Relational SQL Analytics Layer (DuckDB)")
+
+    query_option = st.selectbox(
+        "Select an Analytical SQL Query to Run:",
+        [
+            "Conference Power Index (Aggregations & Grouping)",
+            "Elite Championship Tier (Barthag >= 0.900)",
+            "Conference-Relative Efficiency (Window Functions)",
+            "Top Defensive Havoc Teams (Defensive Filters)"
+        ]
+    )
+
+    conn = duckdb.connect(DATA_DIR + "/cbb.duckdb")
+
+    if query_option == "Conference Power Index (Aggregations & Grouping)":
+        sql = """
+        SELECT 
+            conf,
+            COUNT(team) AS total_programs,
+            ROUND(AVG(adj_oe), 2) AS avg_offensive_rating,
+            ROUND(AVG(adj_de), 2) AS avg_defensive_rating,
+            ROUND(AVG(adj_oe - adj_de), 2) AS avg_net_rating,
+            ROUND(AVG(barthag), 3) AS avg_barthag_power
+        FROM ratings_2024
+        GROUP BY conf
+        HAVING COUNT(team) >= 8
+        ORDER BY avg_net_rating DESC;
+        """
+    elif query_option == "Elite Championship Tier (Barthag >= 0.900)":
+        sql = """
+        SELECT 
+            team, conf,
+            ROUND(adj_oe, 1) AS adj_oe,
+            ROUND(adj_de, 1) AS adj_de,
+            ROUND(adj_oe - adj_de, 1) AS net_efficiency,
+            ROUND(barthag, 4) AS barthag,
+            ROUND(efg_off, 1) AS efg_off_pct,
+            ROUND(to_rate, 1) AS to_rate_pct
+        FROM ratings_2024
+        WHERE barthag >= 0.900
+        ORDER BY barthag DESC;
+        """
+    elif query_option == "Conference-Relative Efficiency (Window Functions)":
+        sql = """
+        WITH conference_baselines AS (
+            SELECT 
+                team, conf, adj_oe, adj_de,
+                (adj_oe - adj_de) AS net_efficiency,
+                barthag,
+                AVG(adj_oe) OVER(PARTITION BY conf) AS conf_avg_oe,
+                AVG(adj_de) OVER(PARTITION BY conf) AS conf_avg_de,
+                DENSE_RANK() OVER(PARTITION BY conf ORDER BY barthag DESC) AS conf_rank,
+                DENSE_RANK() OVER(ORDER BY barthag DESC) AS national_rank
+            FROM ratings_2024
+        )
+        SELECT 
+            team, conf, conf_rank, national_rank,
+            ROUND(net_efficiency, 2) AS net_eff,
+            ROUND(adj_oe - conf_avg_oe, 2) AS oe_above_conf_avg,
+            ROUND(conf_avg_de - adj_de, 2) AS de_better_than_conf_avg,
+            ROUND(barthag, 3) AS barthag
+        FROM conference_baselines
+        WHERE conf IN ('B12', 'B10', 'SEC', 'BE', 'ACC') AND conf_rank <= 3
+        ORDER BY national_rank ASC;
+        """
+    else:
+        sql = """
+        SELECT 
+            team, conf,
+            ROUND(efg_def, 1) AS opp_efg_pct,
+            ROUND(dr_rate, 1) AS def_rebound_pct,
+            ROUND(adj_de, 1) AS adj_de,
+            DENSE_RANK() OVER(ORDER BY adj_de ASC) AS def_rank
+        FROM ratings_2024
+        WHERE efg_def < 48.0 AND dr_rate >= 75.0
+        ORDER BY adj_de ASC
+        LIMIT 15;
+        """
+
+    result_df = conn.execute(sql).df()
+    conn.close()
+
+    with st.expander("Show SQL Code", expanded=False):
+        st.code(sql, language="sql")
+
+    st.dataframe(result_df, use_container_width=True)
